@@ -2,12 +2,12 @@ from queue import Queue, Full
 from threading import Thread, Lock
 
 
-class RequestsQueue(object):
-    def __init__(self, logger, max_threads, max_q_size, request_handler):
+class MultiWorkerQueue(object):
+    def __init__(self, logger, max_threads, max_q_size, task_handler):
         self.logger = logger
         self.max_threads = max_threads
         self.max_q_size = max_q_size
-        self.request_handler = request_handler
+        self.task_handler = task_handler
         self.raised_exception = None
 
         self._client_queues = {}
@@ -21,19 +21,22 @@ class RequestsQueue(object):
             self._threads.append(thread)
             thread.start()
 
-    def push(self, request, client_id):
-        if request is None or client_id is None:
+    def push(self, task, client_id):
+        if task is None or client_id is None:
             raise ValueError()
+
+        if client_id not in self._client_queues:
+            raise ClientNotFoundError(f"{client_id} client not added / removed from queue")
 
         with self._dict_lock:
             client_queue = self._client_queues[client_id]
 
         try:
-            client_queue.put(request)
+            client_queue.put(task)
         except Full:
-            self.logger.error(f"{len(client_queue.queue)} pending video "
-                              f"encoding requests for session {client_id}. "
-                              f"Ignoring request!")
+            self.logger.error(f"{len(client_queue.queue)} pending tasks"
+                              f" for client {client_id}. "
+                              f"Ignoring task!")
             return
 
         with client_queue.mutex:
@@ -46,20 +49,21 @@ class RequestsQueue(object):
             self._client_queues[client_id] = Queue(maxsize=self.max_q_size)
             self._client_queues[client_id].scheduled = False
 
-    def remove_client(self, client_id, handle_finish, wait_to_pending_requests):
+    def remove_client(self, client_id, wait_to_pending_tasks, handle_finish, *handle_finish_args):
         with self._dict_lock:
             client_queue = self._client_queues.pop(client_id)
 
         if not client_queue.scheduled:
             client_queue.join()
-            handle_finish()
+            if handle_finish:
+                handle_finish(*handle_finish_args)
             return
 
-        if not wait_to_pending_requests:
+        if not wait_to_pending_tasks:
             with client_queue.mutex:
                 client_queue.queue.clear()
 
-        self._finish_handlers[client_queue] = handle_finish
+        self._finish_handlers[client_queue] = handle_finish, handle_finish_args
         client_queue.put(None)  # Poison pill
         client_queue.join()
 
@@ -83,14 +87,15 @@ class RequestsQueue(object):
                 self._schedule_queue.task_done()
                 return
 
-            request = client_queue.get()
+            task = client_queue.get()
 
-            if request is None:
+            if task is None:
                 # Queue finished
-                handle_finish = self._finish_handlers.pop(client_queue)
+                handle_finish, handle_finish_args = self._finish_handlers.pop(client_queue)
                 client_queue.task_done()
                 client_queue.join()
-                handle_finish()
+                if handle_finish:
+                    handle_finish(*handle_finish_args)
 
             else:
                 # Push client queue to the back (round robin scheduling) if not empty
@@ -102,11 +107,16 @@ class RequestsQueue(object):
                         client_queue.scheduled = False
 
                 try:
-                    self.request_handler(request)
+                    self.task_handler(task)
                 except Exception as e:
-                    self.logger.error("Requests executor failed to handle request")
+                    self.logger.error("MultiWorkerQueue failed to handle task")
                     self.raised_exception = e
 
                 client_queue.task_done()
 
             self._schedule_queue.task_done()
+
+
+class ClientNotFoundError(BaseException):
+    pass
+
